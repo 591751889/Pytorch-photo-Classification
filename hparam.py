@@ -8,7 +8,7 @@ class hparams:
     train_or_test = "train"
 
     data_root = "/autodl-fs/data/classified_images"
-    train_dir = "/autodl-fs/data/classified_images/test"
+    train_dir = "/autodl-fs/data/classified_images/train"
     val_dir = "/autodl-fs/data/classified_images/valid"
     test_dir = "/autodl-fs/data/classified_images/test"
 
