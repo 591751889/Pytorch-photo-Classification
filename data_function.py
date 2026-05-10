@@ -1,119 +1,213 @@
+# -*- coding: utf-8 -*-
+"""
+图像分类数据集定义文件。
+
+支持如下目录结构：
+root_dir/
+    0/
+        xxx.jpg
+        xxx.png
+    1/
+        xxx.jpg
+        xxx.png
+    ...
+
+每个类别一个文件夹，文件夹名作为类别名。
+"""
+
 import os
-import torch
-from torch.utils.data import Dataset, DataLoader
+from typing import Callable, List, Optional, Tuple
+
 from PIL import Image
+import torch
+from torch.utils.data import Dataset
 from torchvision import transforms
-import numpy as np
 
 
-# 定义基础数据集类
+IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
+
+
+def sort_class_names(class_names: List[str]) -> List[str]:
+    """
+    对类别名排序。
+
+    如果类别名都是数字字符串，例如 0、1、2、10，则按照数字大小排序；
+    否则按照普通字符串排序。
+    """
+    if all(class_name.isdigit() for class_name in class_names):
+        return sorted(class_names, key=lambda x: int(x))
+
+    return sorted(class_names)
+
+
 class BaseDataset(Dataset):
-    def __init__(self, root_dir: str, transform=None, data_type: str = 'image'):
+    """
+    基础图像分类数据集。
+    """
+
+    def __init__(
+        self,
+        root_dir: str,
+        transform: Optional[Callable] = None,
+        data_type: str = "image",
+    ):
         """
-        初始化数据集
-        :param root_dir: 数据根目录
-        :param transform: 数据预处理变换
-        :param data_type: 数据类型 ('image')
+        初始化数据集。
+
+        Args:
+            root_dir: 数据根目录，例如 /autodl-fs/data/classified_images/train
+            transform: 图像预处理或增强操作
+            data_type: 数据类型，目前只支持 image
         """
         self.root_dir = root_dir
         self.transform = transform
         self.data_type = data_type
-        self.classes = sorted(os.listdir(root_dir))  # 获取类别名称
-        self.image_paths = []
-        self.labels = []
 
-        # 遍历每个类别文件夹，直接将所有文件路径添加到列表中
-        for label, class_name in enumerate(self.classes):
+        if not os.path.isdir(root_dir):
+            raise FileNotFoundError(f"数据目录不存在: {root_dir}")
+
+        class_names = [
+            name for name in os.listdir(root_dir)
+            if os.path.isdir(os.path.join(root_dir, name))
+        ]
+        self.classes = sort_class_names(class_names)
+        self.class_to_idx = {
+            class_name: idx for idx, class_name in enumerate(self.classes)
+        }
+
+        self.image_paths: List[str] = []
+        self.labels: List[int] = []
+
+        for class_name in self.classes:
             class_dir = os.path.join(root_dir, class_name)
-            for file_name in os.listdir(class_dir):
-                if file_name.endswith(('.jpg', '.jpeg', '.png', '.bmp')):  # 只处理图像文件
-                    self.image_paths.append(os.path.join(class_dir, file_name))
+            label = self.class_to_idx[class_name]
+
+            file_names = sorted(os.listdir(class_dir))
+            for file_name in file_names:
+                if file_name.lower().endswith(IMAGE_EXTENSIONS):
+                    image_path = os.path.join(class_dir, file_name)
+                    self.image_paths.append(image_path)
                     self.labels.append(label)
 
-    def __len__(self):
-        """返回数据集大小"""
+        if len(self.image_paths) == 0:
+            raise RuntimeError(f"目录下没有找到图像文件: {root_dir}")
+
+        print(f"[Dataset] root_dir: {root_dir}")
+        print(f"[Dataset] classes: {self.classes}")
+        print(f"[Dataset] class_to_idx: {self.class_to_idx}")
+        print(f"[Dataset] image_count: {len(self.image_paths)}")
+
+    def __len__(self) -> int:
+        """
+        返回数据集大小。
+        """
         return len(self.image_paths)
 
-    def __getitem__(self, idx: int):
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
         """
-        获取指定索引的数据
-        :param idx: 数据索引
-        :return: (image, label)
+        获取一个样本。
+
+        Args:
+            idx: 样本索引
+
+        Returns:
+            image: 图像张量，shape 为 [3, 224, 224]
+            label: 类别标签
         """
-        img_path = self.image_paths[idx]
+        image_path = self.image_paths[idx]
         label = self.labels[idx]
 
-        # 使用 PIL 读取普通图像（2D 图像）
-        image = Image.open(img_path).convert('RGB')  # 读取图像文件
+        image = Image.open(image_path).convert("RGB")
 
-        # 调整图像大小到 224x224
-        image = image.resize((224, 224))  # 统一调整图像大小为 224x224
-
-        # 转换为 tensor
-        image = transforms.ToTensor()(image)  # 转为 tensor 类型并自动归一化到 [0, 1] 范围
-
-        # 如果存在 transform，应用 transform
-        if self.transform:
+        if self.transform is not None:
             image = self.transform(image)
 
         return image, label
 
 
-# 训练数据类，包含数据增强
 class TrainData(BaseDataset):
-    def __init__(self, root_dir: str, transform=None, data_type: str = 'image'):
-        # 训练数据增强操作
-        train_transform = transforms.Compose([
-            transforms.RandomHorizontalFlip(),  # 随机水平翻转
-            transforms.RandomRotation(10),  # 随机旋转
-            transforms.RandomResizedCrop(224),  # 随机裁剪并调整到 224x224
-        ])
-        super().__init__(root_dir, transform=train_transform if transform is None else transform, data_type=data_type)
+    """
+    训练集数据类，包含数据增强。
+    """
+
+    def __init__(
+        self,
+        root_dir: str,
+        transform: Optional[Callable] = None,
+        data_type: str = "image",
+    ):
+        if transform is None:
+            transform = transforms.Compose([
+                transforms.RandomResizedCrop(224),
+                transforms.RandomHorizontalFlip(),
+                transforms.RandomRotation(10),
+                transforms.ToTensor(),
+                transforms.Normalize(
+                    mean=[0.485, 0.456, 0.406],
+                    std=[0.229, 0.224, 0.225],
+                ),
+            ])
+
+        super().__init__(
+            root_dir=root_dir,
+            transform=transform,
+            data_type=data_type,
+        )
 
 
-# 验证数据类
 class ValData(BaseDataset):
-    def __init__(self, root_dir: str, transform=None, data_type: str = 'image'):
-        val_transform = transforms.Compose([
-            transforms.Resize(256),  # 调整大小为 256
-            transforms.CenterCrop(224),  # 裁剪中央区域为 224x224
-        ])
-        super().__init__(root_dir, transform=val_transform if transform is None else transform, data_type=data_type)
+    """
+    验证集数据类，不做随机增强。
+    """
+
+    def __init__(
+        self,
+        root_dir: str,
+        transform: Optional[Callable] = None,
+        data_type: str = "image",
+    ):
+        if transform is None:
+            transform = transforms.Compose([
+                transforms.Resize(256),
+                transforms.CenterCrop(224),
+                transforms.ToTensor(),
+                transforms.Normalize(
+                    mean=[0.485, 0.456, 0.406],
+                    std=[0.229, 0.224, 0.225],
+                ),
+            ])
+
+        super().__init__(
+            root_dir=root_dir,
+            transform=transform,
+            data_type=data_type,
+        )
 
 
-# 测试数据类
 class TestData(BaseDataset):
-    def __init__(self, root_dir: str, transform=None, data_type: str = 'image'):
-        test_transform = transforms.Compose([
-            transforms.Resize(256),  # 调整大小为 256
-            transforms.CenterCrop(224),  # 裁剪中央区域为 224x224
-        ])
-        super().__init__(root_dir, transform=test_transform if transform is None else transform, data_type=data_type)
+    """
+    测试集数据类，不做随机增强。
+    """
 
+    def __init__(
+        self,
+        root_dir: str,
+        transform: Optional[Callable] = None,
+        data_type: str = "image",
+    ):
+        if transform is None:
+            transform = transforms.Compose([
+                transforms.Resize(256),
+                transforms.CenterCrop(224),
+                transforms.ToTensor(),
+                transforms.Normalize(
+                    mean=[0.485, 0.456, 0.406],
+                    std=[0.229, 0.224, 0.225],
+                ),
+            ])
 
-# 打印一个batch的数据
-def print_batch(data_loader: DataLoader):
-    images, labels = next(iter(data_loader))
-    print(f"Batch size: {len(images)}")
-    print(f"Images shape: {images.shape}")
-    print(f"Labels: {labels}")
-
-
-# 使用示例
-if __name__ == '__main__':
-    root_dir = './flower_photos'  # 替换为你的数据集路径
-    batch_size = 8
-    data_type = 'image'  # 只处理二维图像
-
-    # 直接创建数据集实例
-    train_data = TrainData(root_dir=root_dir, data_type=data_type)
-    val_data = ValData(root_dir=root_dir, data_type=data_type)
-    test_data = TestData(root_dir=root_dir, data_type=data_type)
-
-    # 创建训练、验证和测试数据加载器
-    train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_data, batch_size=batch_size, shuffle=False, num_workers=4)
-    test_loader = DataLoader(test_data, batch_size=batch_size, shuffle=False, num_workers=4)
-
-    # 打印训练数据的一个batch
-    print_batch(train_loader)
+        super().__init__(
+            root_dir=root_dir,
+            transform=transform,
+            data_type=data_type,
+        )

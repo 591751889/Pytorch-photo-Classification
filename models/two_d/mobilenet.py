@@ -1,217 +1,303 @@
+# -*- coding: utf-8 -*-
+"""
+MobileNetV2 图像分类模型定义文件。
+
+本文件实现适用于 2D 图像分类任务的 MobileNetV2。
+
+输入：
+    image: [B, 3, 224, 224]
+
+输出：
+    logits: [B, num_classes]
+
+使用示例：
+    from models.two_d.mobilenet import MobileNetV2
+
+    model = MobileNetV2(num_classes=6)
+"""
+
+from typing import List
+
 import torch
-import torch.nn as nn
+from torch import nn
 
 
-class DepthSeperabelConv2d(nn.Module):
+class ConvBNReLU(nn.Sequential):
+    """
+    Conv2d + BatchNorm2d + ReLU6 基础模块。
+    """
 
-    def __init__(self, input_channels, output_channels, kernel_size, **kwargs):
-        super().__init__()
-        self.depthwise = nn.Sequential(
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int = 3,
+        stride: int = 1,
+        groups: int = 1,
+    ):
+        padding = (kernel_size - 1) // 2
+
+        super(ConvBNReLU, self).__init__(
             nn.Conv2d(
-                input_channels,
-                input_channels,
-                kernel_size,
-                groups=input_channels,
-                **kwargs),
-            nn.BatchNorm2d(input_channels),
-            nn.ReLU(inplace=True)
+                in_channels=in_channels,
+                out_channels=out_channels,
+                kernel_size=kernel_size,
+                stride=stride,
+                padding=padding,
+                groups=groups,
+                bias=False,
+            ),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU6(inplace=True),
         )
 
-        self.pointwise = nn.Sequential(
-            nn.Conv2d(input_channels, output_channels, 1),
-            nn.BatchNorm2d(output_channels),
-            nn.ReLU(inplace=True)
+
+class InvertedResidual(nn.Module):
+    """
+    MobileNetV2 倒残差模块。
+
+    结构：
+        1x1 pointwise conv 升维
+        3x3 depthwise conv
+        1x1 pointwise conv 降维
+
+    当 stride=1 且输入输出通道一致时，使用残差连接。
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        stride: int,
+        expand_ratio: int,
+    ):
+        super(InvertedResidual, self).__init__()
+
+        if stride not in [1, 2]:
+            raise ValueError("stride 只能是 1 或 2，当前为: %d" % stride)
+
+        hidden_dim = in_channels * expand_ratio
+        self.use_res_connect = stride == 1 and in_channels == out_channels
+
+        layers = []
+
+        if expand_ratio != 1:
+            layers.append(
+                ConvBNReLU(
+                    in_channels=in_channels,
+                    out_channels=hidden_dim,
+                    kernel_size=1,
+                    stride=1,
+                )
+            )
+
+        layers.extend([
+            ConvBNReLU(
+                in_channels=hidden_dim,
+                out_channels=hidden_dim,
+                kernel_size=3,
+                stride=stride,
+                groups=hidden_dim,
+            ),
+            nn.Conv2d(
+                in_channels=hidden_dim,
+                out_channels=out_channels,
+                kernel_size=1,
+                stride=1,
+                padding=0,
+                bias=False,
+            ),
+            nn.BatchNorm2d(out_channels),
+        ])
+
+        self.conv = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        前向传播。
+        """
+        if self.use_res_connect:
+            return x + self.conv(x)
+
+        return self.conv(x)
+
+
+class MobileNetV2(nn.Module):
+    """
+    MobileNetV2 分类网络。
+    """
+
+    def __init__(
+        self,
+        num_classes: int = 6,
+        in_channels: int = 3,
+        width_mult: float = 1.0,
+        dropout: float = 0.2,
+        init_weights: bool = True,
+    ):
+        """
+        初始化 MobileNetV2。
+
+        Args:
+            num_classes: 分类类别数
+            in_channels: 输入图像通道数，RGB 图像为 3
+            width_mult: 通道宽度倍率，默认 1.0
+            dropout: 分类头 dropout 概率
+            init_weights: 是否初始化模型参数
+        """
+        super(MobileNetV2, self).__init__()
+
+        block = InvertedResidual
+
+        input_channel = int(32 * width_mult)
+        last_channel = int(1280 * max(1.0, width_mult))
+
+        # t: expansion ratio
+        # c: output channels
+        # n: block repeat number
+        # s: stride
+        inverted_residual_setting: List[List[int]] = [
+            [1, 16, 1, 1],
+            [6, 24, 2, 2],
+            [6, 32, 3, 2],
+            [6, 64, 4, 2],
+            [6, 96, 3, 1],
+            [6, 160, 3, 2],
+            [6, 320, 1, 1],
+        ]
+
+        features = [
+            ConvBNReLU(
+                in_channels=in_channels,
+                out_channels=input_channel,
+                kernel_size=3,
+                stride=2,
+            )
+        ]
+
+        for expand_ratio, output_channel, repeat_num, stride in inverted_residual_setting:
+            output_channel = int(output_channel * width_mult)
+
+            for block_idx in range(repeat_num):
+                current_stride = stride if block_idx == 0 else 1
+
+                features.append(
+                    block(
+                        in_channels=input_channel,
+                        out_channels=output_channel,
+                        stride=current_stride,
+                        expand_ratio=expand_ratio,
+                    )
+                )
+
+                input_channel = output_channel
+
+        features.append(
+            ConvBNReLU(
+                in_channels=input_channel,
+                out_channels=last_channel,
+                kernel_size=1,
+                stride=1,
+            )
         )
 
-    def forward(self, x):
-        x = self.depthwise(x)
-        x = self.pointwise(x)
+        self.features = nn.Sequential(*features)
+
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+
+        self.classifier = nn.Sequential(
+            nn.Dropout(p=dropout),
+            nn.Linear(last_channel, num_classes),
+        )
+
+        if init_weights:
+            self._initialize_weights()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        前向传播。
+        """
+        x = self.features(x)
+        x = self.avgpool(x)
+        x = torch.flatten(x, start_dim=1)
+        x = self.classifier(x)
 
         return x
 
+    def _initialize_weights(self) -> None:
+        """
+        初始化模型参数。
+        """
+        for module in self.modules():
+            if isinstance(module, nn.Conv2d):
+                nn.init.kaiming_normal_(
+                    module.weight,
+                    mode="fan_out",
+                    nonlinearity="relu",
+                )
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
 
-class BasicConv2d(nn.Module):
+            elif isinstance(module, nn.BatchNorm2d):
+                nn.init.constant_(module.weight, 1)
+                nn.init.constant_(module.bias, 0)
 
-    def __init__(self, input_channels, output_channels, kernel_size, **kwargs):
-
-        super().__init__()
-        self.conv = nn.Conv2d(
-            input_channels, output_channels, kernel_size, **kwargs)
-        self.bn = nn.BatchNorm2d(output_channels)
-        self.relu = nn.ReLU(inplace=True)
-
-    def forward(self, x):
-        x = self.conv(x)
-        x = self.bn(x)
-        x = self.relu(x)
-
-        return x
+            elif isinstance(module, nn.Linear):
+                nn.init.normal_(
+                    module.weight,
+                    mean=0,
+                    std=0.01,
+                )
+                nn.init.constant_(module.bias, 0)
 
 
-class MobileNet(nn.Module):
-
+def mobilenet_v2(
+    num_classes: int = 6,
+    in_channels: int = 3,
+    width_mult: float = 1.0,
+    dropout: float = 0.2,
+    init_weights: bool = True,
+) -> MobileNetV2:
     """
-    Args:
-        width multipler: The role of the width multiplier α is to thin
-                         a network uniformly at each layer. For a given
-                         layer and width multiplier α, the number of
-                         input channels M becomes αM and the number of
-                         output channels N becomes αN.
+    构建 MobileNetV2。
     """
+    model = MobileNetV2(
+        num_classes=num_classes,
+        in_channels=in_channels,
+        width_mult=width_mult,
+        dropout=dropout,
+        init_weights=init_weights,
+    )
 
-    def __init__(self, width_multiplier=1, class_num=100):
-       super().__init__()
-
-       alpha = width_multiplier
-       self.stem = nn.Sequential(
-           BasicConv2d(1, int(32 * alpha), 3, padding=1, bias=False),
-           DepthSeperabelConv2d(
-               int(32 * alpha),
-               int(64 * alpha),
-               3,
-               padding=1,
-               bias=False
-           )
-       )
-
-       #downsample
-       self.conv1 = nn.Sequential(
-           DepthSeperabelConv2d(
-               int(64 * alpha),
-               int(128 * alpha),
-               3,
-               stride=2,
-               padding=1,
-               bias=False
-           ),
-           DepthSeperabelConv2d(
-               int(128 * alpha),
-               int(128 * alpha),
-               3,
-               padding=1,
-               bias=False
-           )
-       )
-
-       #downsample
-       self.conv2 = nn.Sequential(
-           DepthSeperabelConv2d(
-               int(128 * alpha),
-               int(256 * alpha),
-               3,
-               stride=2,
-               padding=1,
-               bias=False
-           ),
-           DepthSeperabelConv2d(
-               int(256 * alpha),
-               int(256 * alpha),
-               3,
-               padding=1,
-               bias=False
-           )
-       )
-
-       #downsample
-       self.conv3 = nn.Sequential(
-           DepthSeperabelConv2d(
-               int(256 * alpha),
-               int(512 * alpha),
-               3,
-               stride=2,
-               padding=1,
-               bias=False
-           ),
-
-           DepthSeperabelConv2d(
-               int(512 * alpha),
-               int(512 * alpha),
-               3,
-               padding=1,
-               bias=False
-           ),
-           DepthSeperabelConv2d(
-               int(512 * alpha),
-               int(512 * alpha),
-               3,
-               padding=1,
-               bias=False
-           ),
-           DepthSeperabelConv2d(
-               int(512 * alpha),
-               int(512 * alpha),
-               3,
-               padding=1,
-               bias=False
-           ),
-           DepthSeperabelConv2d(
-               int(512 * alpha),
-               int(512 * alpha),
-               3,
-               padding=1,
-               bias=False
-           ),
-           DepthSeperabelConv2d(
-               int(512 * alpha),
-               int(512 * alpha),
-               3,
-               padding=1,
-               bias=False
-           )
-       )
-
-       #downsample
-       self.conv4 = nn.Sequential(
-           DepthSeperabelConv2d(
-               int(512 * alpha),
-               int(1024 * alpha),
-               3,
-               stride=2,
-               padding=1,
-               bias=False
-           ),
-           DepthSeperabelConv2d(
-               int(1024 * alpha),
-               int(1024 * alpha),
-               3,
-               padding=1,
-               bias=False
-           )
-       )
-
-       self.fc = nn.Linear(int(1024 * alpha), class_num)
-       self.avg = nn.AdaptiveAvgPool2d(1)
-
-    def forward(self, x):
-        x = self.stem(x)
-
-        x = self.conv1(x)
-        x = self.conv2(x)
-        x = self.conv3(x)
-        x = self.conv4(x)
-
-        x = self.avg(x)
-        x = x.view(x.size(0), -1)
-        x = self.fc(x)
-        return x
+    return model
 
 
-def mobilenet(class_num=100):
-    alpha=1
-    return MobileNet(alpha, class_num)
+def mobilenet(
+    num_classes: int = 6,
+    in_channels: int = 3,
+    width_mult: float = 1.0,
+    dropout: float = 0.2,
+    init_weights: bool = True,
+) -> MobileNetV2:
+    """
+    默认构建 MobileNetV2。
+
+    这个函数主要是为了让训练脚本里可以直接写 model_name == "mobilenet"。
+    """
+    return mobilenet_v2(
+        num_classes=num_classes,
+        in_channels=in_channels,
+        width_mult=width_mult,
+        dropout=dropout,
+        init_weights=init_weights,
+    )
 
 
 if __name__ == "__main__":
+    model = MobileNetV2(num_classes=6)
 
+    x = torch.randn(2, 3, 224, 224)
+    y = model(x)
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    image_size = 256
-    x = torch.Tensor(1, 1, image_size, image_size)
-    x = x.to(device)
-    print("x size: {}".format(x.size()))
-    
-    model = mobilenet(class_num=2).to(device)
-    
-
-    out1 = model(x)
-    print("out size: {}".format(out1.size()))
+    print("Input shape:", x.shape)
+    print("Output shape:", y.shape)
